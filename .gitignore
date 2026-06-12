@@ -2,3 +2,12 @@ node_modules/*
 dist/*
 
 .env
+.env.sample
+
+# Uploaded files (simulation)
+uploads/*
+!uploads/.gitkeep
+
+# Firebase service account key
+src/utils/serviceAccountKey.json
+src/utils/skyid-4b3f0-firebase-adminsdk-fbsvc-9ba766719c.json

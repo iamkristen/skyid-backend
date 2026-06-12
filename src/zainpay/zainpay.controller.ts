@@ -23,6 +23,11 @@ export class ZainpayHelper {
   static virutalAccountNumber = process.env.ZAINPAY_VIRTUAL_ACCOUNT_NUMBER!;
   static virtualAccountBankCode = process.env.ZAINPAY_VIRTUAL_ACCOUNT_BANK_CODE!;
 
+  /** Whether the Zainpay gateway has the minimum credentials to initialize payments. */
+  static get isConfigured(): boolean {
+    return Boolean(process.env.ZAINPAY_PUBLIC_KEY && process.env.ZAINPAY_ZAINBOX_CODE);
+  }
+
   static async initializeTransaction(amount: number, email: string, mobileNumber: string, callbackUrl?: string) {
     const txnRef = nanoid(12);
     const payload = {
@@ -39,8 +44,11 @@ export class ZainpayHelper {
       sandbox: this.sandbox,
       data: payload,
     });
+    if (!response) {
+      throw new Error("Zainpay returned no response for initialize transaction");
+    }
     if (response.code !== "00" || !response.data) {
-      throw new Error(`Failed to initialize transaction: ${response}`);
+      throw new Error(`Failed to initialize transaction: code=${response.code} description=${(response as any).description ?? JSON.stringify(response)}`);
     }
     return { ...response, txnRef };
   }
@@ -66,8 +74,11 @@ export class ZainpayHelper {
       data: payload,
     });
 
+    if (!response) {
+      throw new Error("Zainpay returned no response for funds transfer");
+    }
     if (response.code !== "21") {
-      throw new Error(`Failed to transfer funds: ${response}`);
+      throw new Error(`Failed to transfer funds: code=${response.code} description=${(response as any).description ?? JSON.stringify(response)}`);
     }
     return { txnRef };
   }

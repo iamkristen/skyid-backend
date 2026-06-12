@@ -7,4 +7,8 @@ export interface IAdminUser {
   verified?: string;
   date?: Date;
   role?: string;
+  roles?: string[];
+  status?: string;
+  twoFactorSecret?: string;
+  twoFactorEnabled?: boolean;
 }

@@ -10,13 +10,38 @@ import Transaction from "../wallet/wallet.transaction.model";
 import mongoose from "mongoose";
 import { uploadFile } from "../utils/firebase";
 import CustomerEnablementRequest from "../customer-enablement/customer.model";
+import AddonSync from "./addon.model";
+import { AstppClient } from "../astpp/astpp.service";
+import fs from "fs";
 import { ZainpayHelper } from "../zainpay/zainpay.controller";
 import { IWallet } from "../wallet/wallet.type";
 import ValidateNumberSchema from "./number.schema";
-import { IPhoneNumber } from "./number.types";
+import { IPhoneNumber, IBuyNumber } from "./number.types";
 import AgentCode from "../agent/agent.code.model";
 
 dotenv.config();
+
+const IVR_COST = 10_000;
+const IVR_REPLACE_COST = 5_000;
+
+// Cached result of whether the (default) MongoDB connection supports
+// multi-document transactions. Standalone servers (typical local dev) do not;
+// only replica sets / mongos do. When unsupported we fall back to plain writes.
+let _txnSupport: boolean | undefined;
+async function dbSupportsTransactions(): Promise<boolean> {
+  if (_txnSupport !== undefined) return _txnSupport;
+  try {
+    const admin = mongoose.connection.db?.admin();
+    const info: any = admin ? await admin.command({ hello: 1 }) : {};
+    _txnSupport = Boolean(info.setName || info.msg === "isdbgrid");
+  } catch {
+    _txnSupport = false;
+  }
+  if (!_txnSupport) {
+    console.warn("⚠️  MongoDB does not support transactions (standalone) - buyNumber will use non-transactional writes.");
+  }
+  return _txnSupport;
+}
 
 export default class NumberController {
   static async checkNumber(req: Request, res: Response) {
@@ -79,103 +104,256 @@ export default class NumberController {
   }
 
   static async buyNumber(req: Request, res: Response) {
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    // Do validation and checks BEFORE starting transaction
     try {
-      const { error, value } = ValidateNumberSchema.buyNumber({
-        ...req.body,
-        _id: req.user?._id,
-      });
-      if (error) return res.status(400).send(error.details[0].message);
-      const { skyId, mappedNumbers, withIVR, withIVM, _id: userId } = value;
+      console.log("buyNumber request body:", JSON.stringify(req.body, null, 2));
+      console.log("req.user:", req.user);
 
-      const user = await User.findById(userId);
-      if (!user) return res.status(401).send({ message: "user not found" });
+      // For signup flows, don't include _id in validation payload
+      // For regular flows, use req.user._id or req.body._id
+      const validationPayload: any = { ...req.body };
 
+      if (req.body.isSignup) {
+        // For signup flows, _id is optional - don't force it
+        // Only include _id if it's explicitly provided
+        if (!validationPayload._id) {
+          delete validationPayload._id;
+        }
+      } else {
+        // For regular flows, use req.user._id or req.body._id
+        validationPayload._id = req.user?._id || req.body._id;
+      }
+
+      console.log("Validation payload:", JSON.stringify(validationPayload, null, 2));
+
+      const { error, value } = ValidateNumberSchema.buyNumber(validationPayload);
+
+      if (error) {
+        console.error("Validation error:", error.details);
+        return res.status(400).send({ message: error.details[0].message, details: error.details });
+      }
+
+      console.log("Validated value:", JSON.stringify(value, null, 2));
+
+      const { skyId, mappedNumbers, withIVR, withIVM, _id: userId, isSignup, email, phoneNumber } = value as IBuyNumber;
+
+      // For signup flow, user doesn't exist yet - do validation checks without session
+      let user = userId ? await User.findById(userId) : null;
+      if (!isSignup && !user) {
+        return res.status(401).send({ message: "user not found" });
+      }
+
+      // Check if skyId is already in use - do this before transaction
       const skyIdCheck = await SkyId.findOne({ skyId });
       if (skyIdCheck) return res.status(403).send({ message: "skyid already in use" });
 
-      let amount = 20_000; // primary mapping cost
-      for (let i = 1 /* skip index 0 (primary mapping) */; i < mappedNumbers.length; i++) {
-        amount += 15_000; // additional mapping cost
-      }
+      // Use a transaction only when the database supports it (replica set /
+      // mongos). On a standalone dev MongoDB, transactions are unavailable, so
+      // we fall back to non-transactional writes.
+      const useTxn = await dbSupportsTransactions();
+      const session = useTxn ? await mongoose.startSession() : null;
+      if (session) session.startTransaction();
 
-      if (withIVR) amount += 20_000; // ivr cost
-      if (withIVM) amount += 5_000; // ivm cost
+      const abortTxn = async () => {
+        if (session) await session.abortTransaction();
+      };
+      const endTxn = async () => {
+        if (session) await session.endSession();
+      };
 
-      amount = amount * 1.075; // add vat 7%
-      amount *= 100; // convert to kobo
+      try {
+        let amount = 20_000; // primary mapping cost
+        for (let i = 1 /* skip index 0 (primary mapping) */; i < mappedNumbers.length; i++) {
+          amount += 15_000; // additional mapping cost
+        }
 
-      const transaction = new Transaction({
-        type: "payment",
-        amount: -amount,
-        paymentType: "buyNumber",
-        skyId,
-        ivr: withIVR,
-        ivm: withIVM,
-      });
-      let paymentUrl: string | undefined = undefined;
-      let wallet: IWallet | null | undefined;
-      
-      // Determine if user should use payment gateway or wallet
-      const shouldUsePaymentGateway = 
-        user.accountType === "Individual" || 
-        (user.accountType === "Channel_Partner" && user.channelPartnerLevel === "Silver") ||
-        (user.accountType === "VSO" && user.parentChannelPartnerLevel === "Silver");
-      
-      if (shouldUsePaymentGateway) {
-        const payment = await ZainpayHelper.initializeTransaction(
-          amount / 100,
-          user.email!,
-          user.phoneNumber!,
-          value.callbackUrl
+        if (withIVR) amount += IVR_COST;
+        if (withIVM) amount += 5_000; // ivm cost
+
+        amount = amount * 1.075; // add vat 7%
+
+        // adjust value in staging environment to reduce testing costs
+        // 20,000 -> 1,000
+        // if (process.env.NODE_ENV === "staging") {
+        //   amount /= 20;
+        // }
+
+        amount *= 100; // convert to kobo
+
+        let paymentUrl: string | undefined = undefined;
+        let wallet: IWallet | null | undefined;
+        let txnRef: string | undefined = undefined;
+
+        // For signup flow, always use payment gateway
+        // For existing users, determine if they should use payment gateway or wallet
+        const shouldUsePaymentGateway =
+          isSignup === true ||
+          user?.accountType === "Individual" ||
+          (user?.accountType === "Channel_Partner" && user.channelPartnerLevel === "Silver") ||
+          (user?.accountType === "VSO" && user.parentChannelPartnerLevel === "Silver");
+
+        // DEV BYPASS: when Zainpay is not configured in development, skip the
+        // gateway and complete the purchase immediately so the app flow can be
+        // tested without real payment. This only triggers when keys are missing,
+        // so it stops automatically once ZAINPAY_* env vars are set.
+        const devPaymentBypass =
+          shouldUsePaymentGateway && !ZainpayHelper.isConfigured && process.env.NODE_ENV === "development";
+
+        if (devPaymentBypass) {
+          console.warn(
+            "⚠️  Zainpay not configured - DEV BYPASS: completing buyNumber without payment for skyId",
+            skyId
+          );
+          txnRef = `DEV-${Date.now()}`;
+          // paymentUrl stays undefined -> app treats it as an immediate success.
+        } else if (shouldUsePaymentGateway) {
+          const paymentEmail = isSignup ? email! : user!.email!;
+          const paymentPhone = isSignup ? phoneNumber! : user!.phoneNumber!;
+
+          console.log("Initializing payment gateway:", {
+            isSignup,
+            amount: amount / 100,
+            email: paymentEmail,
+            phone: paymentPhone,
+            callbackUrl: value.callbackUrl,
+          });
+
+          try {
+            const payment = await ZainpayHelper.initializeTransaction(
+              amount / 100,
+              paymentEmail,
+              paymentPhone,
+              value.callbackUrl
+            );
+            console.log("Payment initialization response:", payment);
+            paymentUrl = payment.data;
+            txnRef = payment.txnRef;
+            console.log("Payment URL set to:", paymentUrl);
+          } catch (paymentError) {
+            console.error("Error initializing payment:", paymentError);
+            throw paymentError;
+          }
+        } else {
+          // use wallet for Platinum Channel Partners & their VSOs
+          // Check wallet with session for transaction consistency
+          const walletQuery = Wallet.findOne({ _id: userId });
+          wallet = await (session ? walletQuery.session(session) : walletQuery);
+          if (!wallet) {
+            await abortTxn();
+            await endTxn();
+            return res.status(401).send({ message: "wallet not found" });
+          }
+          if (wallet.amount < amount) {
+            await abortTxn();
+            await endTxn();
+            return res.status(402).send({ message: "insufficient balance" });
+          }
+
+          // deduct amount from wallet
+          await Wallet.updateOne(
+            { _id: userId },
+            { $inc: { amount: -amount } },
+            session ? { session } : {}
+          );
+        }
+
+        // Create transaction using Model.create with session
+        const transaction = await Transaction.create(
+          [
+            {
+              type: "payment",
+              amount: -amount,
+              paymentType: "buyNumber",
+              skyId,
+              ivr: withIVR,
+              ivm: withIVM,
+              accountNumber: wallet ? wallet.accountNumber : undefined,
+              status: wallet || devPaymentBypass ? "success" : "pending",
+              txnRef: txnRef,
+              // Store signup data for account creation after payment
+              ...(isSignup && {
+                isSignup: true,
+                signupEmail: email,
+                signupPhoneNumber: phoneNumber,
+              }),
+            },
+          ],
+          session ? { session } : {}
         );
-        paymentUrl = payment.data;
-        transaction.txnRef = payment.txnRef;
-      } else {
-        // use wallet for Platinum Channel Partners & their VSOs
-        wallet = await Wallet.findOne({ _id: userId });
-        if (!wallet) return res.status(401).send({ message: "wallet not found" });
-        if (wallet.amount < amount) return res.status(402).send({ message: "insufficient balance" });
 
-        // deduct amount from wallet
-        await Wallet.updateOne({ _id: userId }, { $inc: { amount: -amount } }, { session });
+        const transactionDoc = transaction[0];
+
+        // For signup flow, create SkyId with temporary userId (will be linked after account creation)
+        // For existing users, use the user's ID
+        const skyIdUserId = isSignup ? new mongoose.Types.ObjectId() : user!._id;
+
+        // Create SkyId using Model.create with session
+        await SkyId.create(
+          [
+            {
+              skyId,
+              mappedNumbers,
+              withIVR,
+              withIVM,
+              userId: skyIdUserId,
+              amount,
+              // In the dev bypass we activate immediately so the number is
+              // usable/visible in the app without a real payment webhook.
+              status: devPaymentBypass ? "active" : "pending",
+            },
+          ],
+          session ? { session } : {}
+        );
+
+        // Create SwitchTeamRequest using Model.create with session
+        await SwitchTeamRequest.create(
+          [
+            {
+              request_type: "buy",
+              skyId,
+              status: wallet || devPaymentBypass ? "pending" : "awaiting",
+              txnRef: transactionDoc._id.toString(),
+              mappedNumbers,
+              amount,
+              createdBy: skyIdUserId,
+            },
+          ],
+          session ? { session } : {}
+        );
+
+        // Update phone number availability.
+        // Note: PhoneNumber lives on a separate (Kirani) connection, so it is
+        // intentionally never part of the default-connection transaction.
+        if (PhoneNumber) {
+          await PhoneNumber.updateOne({ number: skyId }, { available: false, usedBy: skyIdUserId, platform: "SKYID" });
+        } else {
+          console.warn("PhoneNumber model is not available");
+        }
+
+        if (session) await session.commitTransaction();
+        console.log("buyNumber completed successfully");
+        return res.status(200).send({ message: "success", data: { ...transactionDoc.toObject(), paymentUrl } });
+      } catch (error) {
+        await abortTxn();
+        console.error("Error in buyNumber transaction:", error);
+        console.error("Error details:", {
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          requestBody: req.body,
+        });
+        return res.status(500).json({
+          message: "Internal Server Error!",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        await endTxn();
       }
-
-      transaction.accountNumber = wallet ? wallet.accountNumber : undefined;
-      transaction.status = wallet ? "success" : "pending";
-      await transaction.save({ session });
-
-      const skyIdRecord = new SkyId({
-        skyId,
-        mappedNumbers,
-        withIVR,
-        withIVM,
-        userId: user._id,
-        amount,
-        status: "pending",
-      });
-      await skyIdRecord.save({ session });
-      const switchReq = new SwitchTeamRequest({
-        request_type: "buy",
-        skyId,
-        status: wallet ? "pending" : "awaiting",
-        txnRef: transaction._id.toString(),
-        mappedNumbers,
-        amount,
-        createdBy: user._id,
-      });
-      await switchReq.save({ session });
-      await PhoneNumber?.updateOne({ number: skyId }, { available: false, usedBy: user._id, platform: "SKYID" });
-
-      await session.commitTransaction();
-      return res.status(200).send({ message: "success", data: { ...transaction.toObject(), paymentUrl } });
     } catch (error) {
-      console.error(error);
-      await session.abortTransaction();
-      return res.status(500).json({ message: "Internal Server Error!" });
-    } finally {
-      await session.endSession();
+      console.error("Error in buyNumber (validation/checks):", error);
+      return res.status(500).json({
+        message: "Internal Server Error!",
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -264,7 +442,7 @@ export default class NumberController {
       });
       let wallet: IWallet | null | undefined;
       let paymentUrl: string | undefined = undefined;
-      
+
       // Determine payment method based on user type
       if (user.accountType === "Channel_Partner") {
         // Channel Partners always use wallet
@@ -276,14 +454,19 @@ export default class NumberController {
         // Check if VSO has wallet (Platinum VSO) or agentCode (Silver VSO)
         wallet = await Wallet.findOne({ _id: userId });
         const agentCode = await AgentCode.findOne({ createdFor: userId.toString() });
-        
+
         if (wallet) {
           // Platinum VSO - use wallet
           if (wallet.amount < amount) return res.status(402).send({ message: "insufficient balance" });
           await Wallet.updateOne({ _id: userId }, { $inc: { amount: -amount } }, { session });
         } else if (agentCode) {
           // Silver VSO with agentCode - use Zainpay
-          const payment = await ZainpayHelper.initializeTransaction(amount / 100, user.email!, user.phoneNumber!, callbackUrl);
+          const payment = await ZainpayHelper.initializeTransaction(
+            amount / 100,
+            user.email!,
+            user.phoneNumber!,
+            callbackUrl
+          );
           paymentUrl = payment.data;
           transaction.txnRef = payment.txnRef;
         } else {
@@ -291,12 +474,22 @@ export default class NumberController {
         }
       } else if (user.accountType === "Individual") {
         // Individual users use Zainpay
-        const payment = await ZainpayHelper.initializeTransaction(amount / 100, user.email!, user.phoneNumber!, callbackUrl);
+        const payment = await ZainpayHelper.initializeTransaction(
+          amount / 100,
+          user.email!,
+          user.phoneNumber!,
+          callbackUrl
+        );
         paymentUrl = payment.data;
         transaction.txnRef = payment.txnRef;
       } else {
         // Agent or other types - use Zainpay
-        const payment = await ZainpayHelper.initializeTransaction(amount / 100, user.email!, user.phoneNumber!, callbackUrl);
+        const payment = await ZainpayHelper.initializeTransaction(
+          amount / 100,
+          user.email!,
+          user.phoneNumber!,
+          callbackUrl
+        );
         paymentUrl = payment.data;
         transaction.txnRef = payment.txnRef;
       }
@@ -375,27 +568,58 @@ export default class NumberController {
 
   static async buyAddons(req: Request, res: Response) {
     const userId = req.user!._id;
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    const useTxn = await dbSupportsTransactions();
+    const session = useTxn ? await mongoose.startSession() : null;
+    if (session) session.startTransaction();
+    const abortTxn = async () => {
+      if (session) await session.abortTransaction();
+    };
+    const endTxn = async () => {
+      if (session) await session.endSession();
+    };
     try {
       const { error, value } = ValidateNumberSchema.buyAddons(req.body);
-      if (error) return res.status(400).send(error.details[0].message);
+      if (error) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send(error.details[0].message);
+      }
 
       const user = await User.findById(userId);
-      if (!user) return res.status(403).send({ message: "user does not exist" });
+      if (!user) {
+        await abortTxn();
+        await endTxn();
+        return res.status(403).send({ message: "user does not exist" });
+      }
 
       const skyId = await SkyId.findOne({ userId, skyId: value.skyId });
-      if (!skyId) return res.status(403).send({ message: "invalid skyid" });
+      if (!skyId) {
+        await abortTxn();
+        await endTxn();
+        return res.status(403).send({ message: "invalid skyid" });
+      }
 
-      if (value.ivr && skyId.withIVR) return res.status(400).send({ message: "ivr already enabled" });
-      if (value.ivm && skyId.withIVM) return res.status(400).send({ message: "ivm already enabled" });
+      if (value.ivr && skyId.withIVR) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send({ message: "ivr already enabled" });
+      }
+      if (value.ivm && skyId.withIVM) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send({ message: "ivm already enabled" });
+      }
 
       let amount = 0;
-      if (value.ivr) amount += 20_000;
+      if (value.ivr) amount += IVR_COST;
       if (value.ivm) amount += 20_000;
       amount *= 100;
 
-      if (amount === 0) return res.status(400).send({ message: "no addon selected" });
+      if (amount === 0) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send({ message: "no addon selected" });
+      }
 
       const transaction = new Transaction({
         type: "payment",
@@ -407,96 +631,248 @@ export default class NumberController {
       });
       let wallet: IWallet | null | undefined;
       let paymentUrl: string | undefined;
-      if (user.accountType === "Individual") {
-        // create finance request for individuals
-        // if (!value.bankName || !value.bankAccountName || !value.bankAccountNumber)
-        //   return res.status(400).send({ message: "Invalid bank details" });
-        // const financeReq = new FinanceTeamRequest({
-        //   request_type: "deposit",
-        //   status: "pending",
-        //   txnRef: transaction._id.toString(),
-        //   amount,
-        //   phoneNumber: user.phoneNumber,
-        //   bankName: value.bankName,
-        //   bankAccountName: value.bankAccountName,
-        //   bankAccountNumber: value.bankAccountNumber,
-        // });
-        // await financeReq.save({ session });
-        const payment = await ZainpayHelper.initializeTransaction(amount / 100, user.email!, user.phoneNumber!, value.callbackUrl);
+
+      const useGateway = user.accountType === "Individual";
+      // DEV BYPASS: when Zainpay is not configured in development, enable the
+      // add-on immediately without payment. Stops once ZAINPAY_* env vars exist.
+      const devPaymentBypass =
+        useGateway && !ZainpayHelper.isConfigured && process.env.NODE_ENV === "development";
+
+      if (devPaymentBypass) {
+        console.warn(
+          "⚠️  Zainpay not configured - DEV BYPASS: enabling addon without payment for skyId",
+          skyId.skyId
+        );
+        if (value.ivr) skyId.withIVR = true;
+        if (value.ivm) skyId.withIVM = true;
+        await skyId.save(session ? { session } : {});
+        transaction.txnRef = `DEV-${Date.now()}`;
+      } else if (useGateway) {
+        const payment = await ZainpayHelper.initializeTransaction(
+          amount / 100,
+          user.email!,
+          user.phoneNumber!,
+          value.callbackUrl
+        );
         paymentUrl = payment.data;
         transaction.txnRef = payment.txnRef;
       } else {
         // immediately update skyid
         skyId.withIVR = value.ivr ?? false;
         skyId.withIVM = value.ivm ?? false;
-        await skyId.save({ session });
+        await skyId.save(session ? { session } : {});
         // use wallet for channel partners & VSOs
-        wallet = await Wallet.findOne({ _id: userId });
-        if (!wallet) return res.status(401).send({ message: "wallet not found" });
-        if (wallet.amount < amount) return res.status(402).send({ message: "insufficient balance" });
+        const walletQuery = Wallet.findOne({ _id: userId });
+        wallet = await (session ? walletQuery.session(session) : walletQuery);
+        if (!wallet) {
+          await abortTxn();
+          await endTxn();
+          return res.status(401).send({ message: "wallet not found" });
+        }
+        if (wallet.amount < amount) {
+          await abortTxn();
+          await endTxn();
+          return res.status(402).send({ message: "insufficient balance" });
+        }
 
         // deduct amount from wallet
-        await Wallet.updateOne({ _id: userId }, { $inc: { amount: -amount } }, { session });
+        await Wallet.updateOne({ _id: userId }, { $inc: { amount: -amount } }, session ? { session } : {});
       }
 
       transaction.accountNumber = wallet ? wallet.accountNumber : undefined;
-      transaction.status = wallet ? "success" : "pending";
-      await transaction.save({ session });
+      transaction.status = wallet || devPaymentBypass ? "success" : "pending";
+      await transaction.save(session ? { session } : {});
 
-      await session.commitTransaction();
+      if (session) await session.commitTransaction();
       return res.status(200).send({ message: "success", data: { ...transaction.toObject(), paymentUrl } });
     } catch (error) {
-      await session.abortTransaction();
+      await abortTxn();
+      console.error("Error in buyAddons:", error);
       return res.status(500).json({ message: "Internal Server Error!" });
     } finally {
-      await session.endSession();
+      await endTxn();
     }
   }
 
   static async uploadAddon(req: Request, res: Response) {
     const userId = req.user!._id;
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    const useTxn = await dbSupportsTransactions();
+    const session = useTxn ? await mongoose.startSession() : null;
+    if (session) session.startTransaction();
+    const abortTxn = async () => {
+      if (session) await session.abortTransaction();
+    };
+    const endTxn = async () => {
+      if (session) await session.endSession();
+    };
     try {
       const { error, value } = ValidateNumberSchema.uploadAddon(JSON.parse(req.body.data));
-      if (error) return res.status(400).send(error.details[0].message);
+      if (error) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send(error.details[0].message);
+      }
 
       const user = await User.findById(userId);
-      if (!user) return res.status(403).send({ message: "user does not exist" });
+      if (!user) {
+        await abortTxn();
+        await endTxn();
+        return res.status(403).send({ message: "user does not exist" });
+      }
 
       const skyId = await SkyId.findOne({ userId, skyId: value.skyId });
-      if (!skyId) return res.status(403).send({ message: "invalid skyid" });
+      if (!skyId) {
+        await abortTxn();
+        await endTxn();
+        return res.status(403).send({ message: "invalid skyid" });
+      }
 
-      if (!value.ivr && !value.ivm) return res.status(400).send({ message: "no addon selected" });
-      if (value.ivr && value.ivm) return res.status(400).send({ message: "select only one addon" });
+      if (!value.ivr && !value.ivm) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send({ message: "no addon selected" });
+      }
+      if (value.ivr && value.ivm) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send({ message: "select only one addon" });
+      }
 
       const file = req.file;
-      if (!file) return res.status(400).send({ message: "no file uploaded" });
+      if (!file) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send({ message: "no file uploaded" });
+      }
 
-      if (value.ivr && !skyId.withIVR) return res.status(402).send({ message: "ivr not enabled" });
-      if (value.ivm && !skyId.withIVM) return res.status(402).send({ message: "ivm not enabled" });
+      const validMimeTypes = [
+        "audio/wav",
+        "audio/wave",
+        "audio/x-wav",
+        "audio/aac",
+        "audio/aacp",
+        "audio/x-aac",
+        "audio/mp4",
+        "audio/m4a",
+        "audio/x-m4a",
+      ];
+      const lowerName = file.originalname.toLowerCase();
+      const validExt =
+        lowerName.endsWith(".wav") || lowerName.endsWith(".wave") || lowerName.endsWith(".aac");
+      if (!validMimeTypes.includes(file.mimetype) && !validExt) {
+        await abortTxn();
+        await endTxn();
+        return res.status(400).send({ message: "Only .wav or .aac files are allowed" });
+      }
+
+      if (value.ivr && !skyId.withIVR) {
+        await abortTxn();
+        await endTxn();
+        return res.status(402).send({ message: "ivr not enabled" });
+      }
+      if (value.ivm && !skyId.withIVM) {
+        await abortTxn();
+        await endTxn();
+        return res.status(402).send({ message: "ivm not enabled" });
+      }
 
       const key = value.ivr ? "ivr" : "ivm";
+
+      // DEV BYPASS: when ASTPP (telephony) is not configured in development,
+      // skip cloud storage + ASTPP recording/ringback and just record the
+      // addon as synced so the app flow can be tested. Stops once ASTPP_API_URL
+      // is set.
+      const mediaSyncConfigured = Boolean(process.env.ASTPP_API_URL);
+      const devUploadBypass = !mediaSyncConfigured && process.env.NODE_ENV === "development";
+
+      if (devUploadBypass) {
+        console.warn(
+          "⚠️  ASTPP not configured - DEV BYPASS: saving addon without cloud sync for skyId",
+          value.skyId
+        );
+        const addonSync = new AddonSync({
+          type: key,
+          skyId: skyId.skyId,
+          userId: user._id,
+          fileName: value.name,
+          fileUrl: `dev-local://${key}/${value.skyId}/${value.name}`,
+          status: "synced",
+        });
+        await addonSync.save(session ? { session } : {});
+        // best-effort cleanup of the temp upload
+        try {
+          if (file.path) fs.unlinkSync(file.path);
+        } catch {
+          /* ignore */
+        }
+        if (session) await session.commitTransaction();
+        return res.status(200).send({ message: "success" });
+      }
+
       const storageFile = await uploadFile(file.path, `${key}/${value.skyId}/${value.name}`, file.mimetype);
       await storageFile.makePublic();
       const fileUrl = `https://storage.googleapis.com/${storageFile.bucket.name}/${storageFile.name}`;
 
-      const enablementReq = new CustomerEnablementRequest({
-        request_type: key,
+      const addonSync = new AddonSync({
+        type: key,
         skyId: skyId.skyId,
-        status: "pending",
+        userId: user._id,
+        fileName: value.name,
         fileUrl,
+        status: "pending",
+      });
+      await addonSync.save(session ? { session } : {});
+
+      const customerListResponse = await AstppClient.listCustomers({
+        object_where_params: { number: skyId.skyId },
       });
 
-      await enablementReq.save({ session });
-      await session.commitTransaction();
+      if (
+        !customerListResponse ||
+        customerListResponse.response_code !== 200 ||
+        !customerListResponse.data ||
+        customerListResponse.data.length === 0
+      ) {
+        throw new Error(`Customer with number ${skyId.skyId} not found in ASTPP.`);
+      }
+
+      const accountId = customerListResponse.data[0].accountid;
+
+      const fileStream = fs.createReadStream(file.path);
+      const recordingResponse = await AstppClient.createRecording(
+        {
+          recording_name: `${key}_${value.name.replace(/[^a-zA-Z0-9]/g, "_")}_${Date.now()}`,
+          reseller_id: "0",
+          accountid: accountId,
+        },
+        fileStream
+      );
+
+      if (!recordingResponse.status || !recordingResponse.data) {
+        throw new Error(
+          `Failed to create recording in ASTPP: ${recordingResponse.error || JSON.stringify(recordingResponse)}`
+        );
+      }
+
+      const recordingId = recordingResponse.data.recording_id;
+
+      const ringbackUpdateSuccess = await AstppClient.updateRingback(skyId.skyId, recordingId.toString());
+      if (!ringbackUpdateSuccess) {
+        throw new Error(`Failed to update ringback for ${skyId.skyId} in ASTPP.`);
+      }
+
+      addonSync.status = "synced";
+      addonSync.astppRecordingId = recordingId.toString();
+      await addonSync.save(session ? { session } : {});
+
+      if (session) await session.commitTransaction();
       return res.status(200).send({ message: "success" });
     } catch (error) {
-      await session.abortTransaction();
+      await abortTxn();
       console.error("Failed to upload addon", error);
       return res.status(500).json({ message: "Internal Server Error!" });
     } finally {
-      await session.endSession();
+      await endTxn();
     }
   }
 
@@ -512,12 +888,25 @@ export default class NumberController {
       const skyId = await SkyId.findOne({ userId, skyId: value.skyId });
       if (!skyId) return res.status(403).send({ message: "invalid skyid" });
 
-      await CustomerEnablementRequest.deleteOne({
+      const addon = await AddonSync.findOne({
         _id: value.requestId,
         skyId: value.skyId,
       });
+
+      if (addon) {
+        // Skip ASTPP ringback reset when telephony isn't configured (e.g. local dev).
+        const mediaSyncConfigured = Boolean(process.env.ASTPP_API_URL);
+        if (addon.status === "synced" && mediaSyncConfigured) {
+          const ringbackUpdateSuccess = await AstppClient.updateRingback(value.skyId, "au-ring");
+          if (!ringbackUpdateSuccess) {
+            console.error(`Failed to reset ringback for ${value.skyId} in ASTPP.`);
+          }
+        }
+        await addon.deleteOne();
+      }
       return res.status(200).send({ message: "success" });
     } catch (error) {
+      console.error("Error deleting addon:", error);
       return res.status(500).json({ message: "Internal Server Error!" });
     }
   }
@@ -564,23 +953,22 @@ export default class NumberController {
         };
         if (skyIdRecord.withIVR) {
           currentData.ivr.status = "Awaiting IVR";
-          const enablementReq = await CustomerEnablementRequest.findOne({
+          const addonRecord = await AddonSync.findOne({
             skyId,
-            request_type: "ivr",
+            type: "ivr",
           }).sort({ createdAt: -1 });
-          if (enablementReq) {
-            currentData.ivr.requestId = enablementReq._id.toString();
-            currentData.ivr.name = enablementReq.fileUrl.split("/").at(-1);
-            switch (enablementReq.status) {
+          if (addonRecord) {
+            currentData.ivr.requestId = addonRecord._id.toString();
+            currentData.ivr.name = addonRecord.fileName;
+            switch (addonRecord.status) {
               case "pending":
                 currentData.ivr.status = "Awaiting Approval";
                 break;
-              case "approved":
+              case "synced":
                 currentData.ivr.status = "IVR Added";
                 break;
-              case "rejected":
-                currentData.ivr.status = "Rejected";
-                currentData.ivr.remark = enablementReq.remark;
+              case "failed":
+                currentData.ivr.status = "Failed";
                 break;
             }
           }
@@ -588,23 +976,22 @@ export default class NumberController {
 
         if (skyIdRecord.withIVM) {
           currentData.ivm.status = "Awaiting IVM";
-          const enablementReq = await CustomerEnablementRequest.findOne({
+          const addonRecord = await AddonSync.findOne({
             skyId,
-            request_type: "ivm",
+            type: "ivm",
           }).sort({ createdAt: -1 });
-          if (enablementReq) {
-            currentData.ivm.requestId = enablementReq._id.toString();
-            currentData.ivm.name = enablementReq.fileUrl.split("/").at(-1);
-            switch (enablementReq.status) {
+          if (addonRecord) {
+            currentData.ivm.requestId = addonRecord._id.toString();
+            currentData.ivm.name = addonRecord.fileName;
+            switch (addonRecord.status) {
               case "pending":
                 currentData.ivm.status = "Awaiting Approval";
                 break;
-              case "approved":
+              case "synced":
                 currentData.ivm.status = "IVM Added";
                 break;
-              case "rejected":
-                currentData.ivm.status = "Rejected";
-                currentData.ivm.remark = enablementReq.remark;
+              case "failed":
+                currentData.ivm.status = "Failed";
                 break;
             }
           }

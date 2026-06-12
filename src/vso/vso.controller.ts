@@ -35,6 +35,15 @@ export default class VsoController {
       if (user.accountType !== "Channel_Partner")
         return res.status(400).send({ message: "You are not a channel partner." });
 
+      // Validate bank details for Silver Channel Partners
+      if (user.channelPartnerLevel === "Silver") {
+        if (!value.bankCode || !value.bankName || !value.accountNumber || !value.accountHolderName) {
+          return res.status(400).send({ 
+            message: "Bank details (bankCode, bankName, accountNumber, accountHolderName) are required for VSOs under Silver Channel Partners" 
+          });
+        }
+      }
+
       const checkUser = await User.findOne({ email: value.email });
       if (checkUser) return res.status(400).send({ message: "Email already exists." });
 
@@ -62,7 +71,15 @@ export default class VsoController {
         status: "active",
         verified: "true",
         createdBy: userId,
+        mustChangePassword: true,
         parentChannelPartnerLevel: user.channelPartnerLevel, // Track parent Channel Partner level
+        // Bank details for Silver Channel Partner's VSOs
+        ...(user.channelPartnerLevel === "Silver" && {
+          bankCode: value.bankCode,
+          bankName: value.bankName,
+          accountNumber: value.accountNumber,
+          accountHolderName: value.accountHolderName,
+        }),
       });
       await vso.save({ session });
 
@@ -86,22 +103,44 @@ export default class VsoController {
         });
         await wallet.save({ session });
       } else {
-        // Silver Channel Partner - Create Agent Code for VSO
-        const code = `${(value.state as string).substring(0, 3).toUpperCase()}_${generateCode()}`;
-        const agentCode = new AgentCode({
-          code,
-          createdFor: vso.id,
-          discountPercent: 0,
-          allocationPercent: 10, // Silver VSOs start with 10% allocation
-          status: "active",
-        });
-        await agentCode.save({ session });
+        // Silver Channel Partner - Create Agent Code for VSO (optional allocation: 0% or 10–15%)
+        const vsoAllocation = value.allocationPercent ?? 0;
+        const channelPartnerAgentCode = await AgentCode.findOne({ createdFor: userId, createdForType: "channel_partner" });
+        if (!channelPartnerAgentCode) {
+          await session.abortTransaction();
+          return res.status(400).send({ message: "Channel Partner agent code not found." });
+        }
 
-        // Update Channel Partner's allocation (reduce from 20% to 10%)
-        const channelPartnerAgentCode = await AgentCode.findOne({ createdFor: userId });
-        if (channelPartnerAgentCode) {
-          channelPartnerAgentCode.allocationPercent = 10; // Channel Partner gets remaining 10%
-          await channelPartnerAgentCode.save({ session });
+        const code = `${(value.state as string).substring(0, 3).toUpperCase()}_${generateCode()}`;
+
+        if (vsoAllocation > 0) {
+          if (vsoAllocation > channelPartnerAgentCode.allocationPercent) {
+            await session.abortTransaction();
+            return res.status(400).send({
+              message: `You cannot allocate more than the channel partner's ${channelPartnerAgentCode.allocationPercent}% to this VSO.`,
+            });
+          }
+
+          const agentCode = new AgentCode({
+            code,
+            createdFor: vso.id,
+            createdForType: "vso",
+            discountPercent: 0,
+            allocationPercent: vsoAllocation,
+            status: "active",
+          });
+          await agentCode.save({ session });
+        } else {
+          // VSO gets 0% – channel partner keeps full allocation
+          const agentCode = new AgentCode({
+            code,
+            createdFor: vso.id,
+            createdForType: "vso",
+            discountPercent: 0,
+            allocationPercent: 0,
+            status: "active",
+          });
+          await agentCode.save({ session });
         }
       }
 
@@ -207,7 +246,7 @@ export default class VsoController {
         
         return {
           ...vso.toObject(),
-          allocationPercent: agentCode?.allocationPercent || 10,
+          allocationPercent: agentCode?.allocationPercent ?? 0,
           totalSales: totalSales,
         };
       })
@@ -235,46 +274,38 @@ export default class VsoController {
         return res.status(403).json({ message: "You can only manage your own VSOs" });
       }
 
-      // Validate allocation percentage
-      if (allocationPercent < 10 || allocationPercent > 15) {
-        return res.status(400).json({ message: "VSO allocation must be between 10% and 15%" });
+      // Validate allocation percentage (0 = revoke allocation; otherwise 0–100 within CP's available pool)
+      if (typeof allocationPercent !== "number" || allocationPercent < 0) {
+        return res.status(400).json({ message: "VSO allocation must be 0 or a positive number" });
       }
 
       // Get current VSO agent code
-      const vsoAgentCode = await AgentCode.findOne({ createdFor: vsoId });
+      const vsoAgentCode = await AgentCode.findOne({ createdFor: vsoId, createdForType: "vso" });
       if (!vsoAgentCode) {
         return res.status(404).json({ message: "VSO agent code not found" });
       }
 
-      // Get Channel Partner's agent code
-      const channelPartnerAgentCode = await AgentCode.findOne({ createdFor: userId });
+      // CP's allocationPercent is their fixed original grant — never mutated by VSO sub-allocations
+      const channelPartnerAgentCode = await AgentCode.findOne({ createdFor: userId, createdForType: "channel_partner" });
       if (!channelPartnerAgentCode) {
         return res.status(404).json({ message: "Channel Partner agent code not found" });
       }
 
-      const currentVSOAllocation = vsoAgentCode.allocationPercent;
-      const allocationChange = allocationPercent - currentVSOAllocation;
-      const newChannelPartnerAllocation = channelPartnerAgentCode.allocationPercent - allocationChange;
-
-      // Validate Channel Partner's new allocation
-      if (newChannelPartnerAllocation < 5 || newChannelPartnerAllocation > 10) {
-        return res.status(400).json({ 
-          message: `Channel Partner allocation would be ${newChannelPartnerAllocation}%, which is outside allowed range (5%-10%)` 
+      if (allocationPercent > channelPartnerAgentCode.allocationPercent) {
+        return res.status(400).json({
+          message: `You cannot allocate more than the channel partner's ${channelPartnerAgentCode.allocationPercent}% to this VSO.`,
         });
       }
 
-      // Update both allocations
+      // Only update the VSO's allocation — CP's allocationPercent is never modified
       vsoAgentCode.allocationPercent = allocationPercent;
-      channelPartnerAgentCode.allocationPercent = newChannelPartnerAllocation;
-
       await vsoAgentCode.save();
-      await channelPartnerAgentCode.save();
 
       return res.status(200).json({ 
         message: "Allocation updated successfully",
         data: {
           vsoAllocation: allocationPercent,
-          channelPartnerAllocation: newChannelPartnerAllocation
+          channelPartnerAllocation: channelPartnerAgentCode.allocationPercent,
         }
       });
 

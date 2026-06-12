@@ -51,6 +51,7 @@ export default class AgentController {
       const agentCode = new AgentCode({
         code,
         createdFor: newAgent.id,
+        createdForType: "agent",
         discountPercent: 0,
         allocationPercent: 5,
         status: "active",

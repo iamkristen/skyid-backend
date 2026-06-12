@@ -17,6 +17,11 @@ export interface ITransaction {
   ivr?: boolean;
   ivm?: boolean;
   transferRecepient?: string;
+  // 
+  isSignup?: boolean;
+  signupEmail?: string;
+  signupPhoneNumber?: string;
+  // 
   createdAt?: Date;
   updatedAt?: Date;
 }

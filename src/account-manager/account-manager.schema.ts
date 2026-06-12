@@ -17,27 +17,59 @@ export const ValidateSchema = {
       state: Joi.string().messages({
         "any.required": "Business name is required",
       }),
+      bvn: Joi.string().length(11).optional().allow("").messages({
+        "string.length": "BVN must be exactly 11 digits",
+      }),
       businessName: Joi.string().messages({
         "any.required": "Business type is required",
       }),
       businessType: Joi.string().messages({
         "any.required": "Business type is required",
       }),
+      cacRnNumber: Joi.string().optional().allow(""),
       channelPartnerLevel: Joi.string().valid("Platinum", "Silver").required().messages({
         "any.only": "Channel partner level must be either 'Platinum' or 'Silver'",
         "any.required": "Channel partner level is required",
       }),
-      nin: Joi.string().min(11).required(),
-
-      // address: Joi.string()
-      //   .messages({
-      //     "any.required": "Address is required",
-      //   })
-      //   .required(),
-      // nin: Joi.string(),
-      // password: Joi.string().messages({
-      //   "any.required": "Business type is required",
-      // }),
+      nin: Joi.string().min(11).max(11).required().messages({
+        "string.min": "NIN must be exactly 11 characters",
+        "string.max": "NIN must be exactly 11 characters",
+        "any.required": "NIN is required",
+      }),
+      // Bank details - required for Silver
+      bankCode: Joi.string().when("channelPartnerLevel", {
+        is: "Silver",
+        then: Joi.required().messages({
+          "any.required": "Bank code is required for Silver partners",
+        }),
+        otherwise: Joi.optional(),
+      }),
+      bankName: Joi.string().when("channelPartnerLevel", {
+        is: "Silver",
+        then: Joi.required().messages({
+          "any.required": "Bank name is required for Silver partners",
+        }),
+        otherwise: Joi.optional(),
+      }),
+      accountNumber: Joi.string().length(10).when("channelPartnerLevel", {
+        is: "Silver",
+        then: Joi.required().messages({
+          "any.required": "Account number is required for Silver partners",
+          "string.length": "Account number must be exactly 10 digits",
+        }),
+        otherwise: Joi.optional(),
+      }),
+      accountHolderName: Joi.string().when("channelPartnerLevel", {
+        is: "Silver",
+        then: Joi.required().messages({
+          "any.required": "Account holder name is required for Silver partners",
+        }),
+        otherwise: Joi.optional(),
+      }),
+      allocationPercent: Joi.number().min(0).max(25).optional().messages({
+        "number.min": "Allocation must be between 0 and 25",
+        "number.max": "Allocation must be between 0 and 25",
+      }),
     }).validate(payload),
 
   // createChannelPartner: (payload: unknown) =>

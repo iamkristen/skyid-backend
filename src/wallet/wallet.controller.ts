@@ -44,21 +44,31 @@ export default class WalletController {
 
   static async getWallet(req: Request, res: Response) {
     try {
-      const userId = req.params.userId; // or req.body._id depending on how you want to pass the ID
+      const userId = req.params.userId;
 
-      // Find the user
       const user = await User.findOne({ _id: userId });
       if (!user) {
         return res.status(404).json({ message: "User not found" });
       }
 
-      // Find the wallet
-      const wallet = await Wallet.findOne({ _id: userId });
+      let wallet = await Wallet.findOne({ _id: userId });
       if (!wallet) {
-        return res.status(404).json({ message: "Wallet not found for this user" });
+        // Lazy-create wallet for users who don't have one (e.g. Silver CP, VSO)
+        let accountNumber = "";
+        while (true) {
+          accountNumber = Math.floor(1000000000 + Math.random() * 9000000000).toString();
+          const existing = await Wallet.findOne({ accountNumber });
+          if (!existing) break;
+        }
+        wallet = new Wallet({
+          _id: user._id,
+          amount: 0,
+          status: "active",
+          accountNumber,
+        });
+        await wallet.save();
       }
 
-      // Return wallet details
       return res.status(200).json({
         message: "success",
         data: wallet,

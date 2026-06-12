@@ -39,8 +39,26 @@ const ValidateVSOSchema = {
         }),
       country: Joi.string(),
       state: Joi.string().required(),
-      nin: Joi.string().min(11).required(),
-    }).validate(payload);
+      nin: Joi.string().min(11).max(11).required().messages({
+        "string.min": "NIN must be exactly 11 characters",
+        "string.max": "NIN must be exactly 11 characters",
+        "any.required": "NIN is required",
+      }),
+      // Bank details - optional in schema, validated in controller for Silver
+      bankCode: Joi.string().optional(),
+      bankName: Joi.string().optional(),
+      accountNumber: Joi.string().length(10).optional().messages({
+        "string.length": "Account number must be exactly 10 digits",
+      }),
+      accountHolderName: Joi.string().optional(),
+      // VSO allocation (Silver only): 0% = no allocation, or up to channel partner's allocation (admin sets CP %, CP shares with VSOs)
+      allocationPercent: Joi.number().min(0).max(25).optional().messages({
+        "number.min": "VSO allocation must be at least 0%",
+        "number.max": "VSO allocation cannot exceed channel partner's allocation",
+      }),
+    })
+      .options({ allowUnknown: true })
+      .validate(payload);
   },
   creditVSO: (payload: { amount: number; vsoId: string }) => {
     return Joi.object<{ amount: number; vsoId: string }>({

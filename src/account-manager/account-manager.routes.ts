@@ -6,6 +6,7 @@ const AccountManagerRoutes = express.Router();
 
 AccountManagerRoutes.get("/channel-partners", validateToken, AccountManagerController.getChannelPartners);
 AccountManagerRoutes.post("/channel-partners", validateToken, AccountManagerController.createChannelPartner);
+AccountManagerRoutes.post("/check-nin", validateToken, AccountManagerController.checkNinExists);
 AccountManagerRoutes.patch("/channel-partners/:id", validateToken, AccountManagerController.updateChannelPartner);
 AccountManagerRoutes.get("/channel-partners/:id/activities", validateToken, AccountManagerController.getChannelPartnerActivities);
 AccountManagerRoutes.get("/requests", AccountManagerController.getRequests);

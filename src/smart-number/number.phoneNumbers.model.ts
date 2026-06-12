@@ -17,7 +17,7 @@ const phoneNumberSchema = new Schema<IPhoneNumber>({
   platform: String,
 });
 
-// 3 Create a Model (only if connection exists)
-const PhoneNumber = connection ? connection.model("phoneNumbers", phoneNumberSchema) : null;
+// 3 Create a Model
+const PhoneNumber = connection?.model("phoneNumbers", phoneNumberSchema);
 
 export default PhoneNumber;

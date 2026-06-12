@@ -17,6 +17,7 @@ import AdminUser from "../admin/admin.model";
 import { generateOtp } from "../utils/generateOtp";
 import generate from "../utils/generate";
 import Kyc from "../kyc/kyc.model";
+import KYCController from "../kyc/kyc.controller";
 import { type ClientSession, startSession } from "mongoose";
 import Wallet from "../wallet/wallet.model";
 import ChannelPartner from "../partner/partner.model";
@@ -31,20 +32,15 @@ dotenv.config();
 export default class UserController {
   static async signup(req: Request, res: Response) {
     let session: ClientSession | undefined = undefined;
-    const useTransactions = process.env.USE_MONGODB_TRANSACTIONS === 'true';
-    
     try {
       const { error, value } = ValidateUserSchema.signup({ ...req.body });
       if (error) return res.status(400).send(error.details[0].message);
 
       let user = await User.findOne({ email: req.body.email.toLowerCase().trim() });
-      if (user) return res.status(400).send({ message: "Email is already used." });
+      if (user) return res.status(400).send({ message: "Email is taken already." });
 
-      // Only use transactions if explicitly enabled (for production/replica sets)
-      if (useTransactions) {
-        session = await startSession();
-        session.startTransaction();
-      }
+      session = await startSession();
+      session.startTransaction();
 
       user = new User({
         ...req.body,
@@ -53,7 +49,7 @@ export default class UserController {
         password: Bcrypt.shared().encode(req.body.password), // encrypt password
       });
 
-      await user.save(session ? { session } : {});
+      await user.save({ session });
 
       let accountNumber;
       let isUnique = false;
@@ -72,24 +68,16 @@ export default class UserController {
         status: "active",
         accountNumber,
       });
-      await wallet.save(session ? { session } : {});
+      await wallet.save({ session });
 
       EmailService.sendWelcomeEmail(req.body.email, req.body.firstName);
 
       const token = jwt.sign({ _id: user._id }, process.env.JWT_PRIVATE_KEY as string, { expiresIn: '7d' });
-      
-      if (session) {
-        await session.commitTransaction();
-        await session.endSession();
-      }
-      
+      await session.commitTransaction();
       return res.status(200).json({ message: "success", accessToken: token });
     } catch (error) {
-      if (session) {
-        await session.abortTransaction();
-        await session.endSession();
-      }
-      console.error("Signup Error:", error);
+      await session?.abortTransaction();
+      await session?.endSession();
       return res.status(500).json({ message: "Internal Server Error!" });
     }
   }
@@ -113,27 +101,95 @@ export default class UserController {
 
   static async userProfile(req: Request, res: Response, next: NextFunction) {
     try {
-      const profileData = await User.findById(req.user?._id).select("-password -__v");
-      
+      const profileData = await User.findById(req.user?._id).select("-password -__v -twoFactorSecret");
+      if (!profileData) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      // Build plain object so non-schema fields (e.g. allocationPercent) are included in JSON response
+      const dataToSend = profileData.toObject ? profileData.toObject() : { ...profileData };
+
       // If user is an agent, get their agentCode
-      if (profileData?.accountType === "Agent") { 
+      if (profileData.accountType === "Agent") {
         const agentCodeData = await AgentCode.findOne({ createdFor: profileData._id });
         if (agentCodeData) {
-          profileData.agentCode = agentCodeData.code;
+          dataToSend.agentCode = agentCodeData.code;
         }
       }
-      
+
+      // If user is a Channel Partner, get their allocation from AgentCode (for allocation slider when creating VSOs)
+      if (profileData.accountType === "Channel_Partner") {
+        const createdForId = profileData._id?.toString?.() ?? String(profileData._id);
+        let agentCodeData = await AgentCode.findOne({ createdFor: createdForId, createdForType: "channel_partner" });
+        if (!agentCodeData && profileData._id) {
+          agentCodeData = await AgentCode.findOne({ createdFor: profileData._id, createdForType: "channel_partner" });
+        }
+        if (agentCodeData) {
+          dataToSend.allocationPercent = agentCodeData.allocationPercent;
+        } else {
+          dataToSend.allocationPercent = 0;
+        }
+      }
+
       // If user is a VSO, get their parent Channel Partner's level to determine wallet/agentCode access
-      if (profileData?.accountType === "VSO" && profileData?.createdBy) {
+      if (profileData.accountType === "VSO" && profileData.createdBy) {
         const parentChannelPartner = await User.findById(profileData.createdBy).select("channelPartnerLevel");
         if (parentChannelPartner) {
-          (profileData as any).parentChannelPartnerLevel = parentChannelPartner.channelPartnerLevel;
+          dataToSend.parentChannelPartnerLevel = parentChannelPartner.channelPartnerLevel;
         }
       }
-      
-      return res.status(200).json({ message: "success", data: profileData });
+
+      return res.status(200).json({ message: "success", data: dataToSend });
     } catch (error) {
       return res.status(500).json({ message: error });
+    }
+  }
+
+  static async updateUserProfile(req: Request, res: Response) {
+    try {
+      const userId = req.user?._id;
+      if (!userId) {
+        return res.status(401).json({ message: "User not authenticated" });
+      }
+
+      const user = await User.findById(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      // Allowed fields that can be updated
+      const allowedFields = [
+        "firstName",
+        "lastName",
+        "middleName",
+        "bio",
+        "profilePicture",
+        "businessName",
+        "businessType",
+        "state",
+        "country",
+        "phoneNumber",
+      ];
+
+      // Update only allowed fields
+      for (const field of allowedFields) {
+        if (req.body[field] !== undefined) {
+          (user as any)[field] = req.body[field];
+        }
+      }
+
+      await user.save();
+
+      // Return updated profile without password
+      const updatedProfile = await User.findById(userId).select("-password -__v");
+
+      return res.status(200).json({
+        message: "Profile updated successfully",
+        data: updatedProfile,
+      });
+    } catch (error: any) {
+      console.error("Error updating user profile:", error);
+      return res.status(500).json({ message: error.message || "Internal Server Error!" });
     }
   }
 
@@ -263,11 +319,73 @@ export default class UserController {
       let kyc = new Kyc({ ...value, user_id: user._id });
       await kyc.save();
 
+      // For Individual: one KYC covers all their smart numbers — set customerId on all their SkyIds
+      if ((user as any).accountType === "Individual") {
+        await SkyId.updateMany(
+          { userId: user._id },
+          { $set: { customerId: user._id.toString() } }
+        );
+      }
+
       EmailService.sendKYCCompletionEmail(user?.email!, user?.firstName!);
       return res.status(200).json({ message: "success" });
 
       // sending user an email confirming that his account has been verified
     } catch (error) {
+      return res.status(500).json({ message: "Internal Server Error!" });
+    }
+  }
+
+  /** Individual KYC: NIN only. Verify NIN via Prembly, store NIN + details in Kyc, set verified, send email */
+  static async kycIndividual(req: Request, res: Response) {
+    try {
+      const { error, value } = ValidateUserSchema.kycIndividual({ ...req.body });
+      if (error) return res.status(400).send(error.details[0].message);
+
+      const user = await User.findOne({ _id: req.user?._id });
+      if (!user) return res.status(400).send({ message: "User does not exist." });
+
+      if ((user as any).accountType !== "Individual") {
+        return res.status(400).send({ message: "This endpoint is for Individual accounts only." });
+      }
+
+      const kycOld = await Kyc.findOne({ user_id: user._id });
+      if (kycOld) return res.status(400).send({ message: "You have already completed your KYC." });
+
+      const nin = String(value.nin).trim().replace(/\s+/g, "");
+      if (nin.length !== 11) return res.status(400).send({ message: "NIN must be exactly 11 digits." });
+
+      const ninResponse = await KYCController.getNINData(nin);
+      const ninData = ninResponse?.nin_data;
+      if (!ninData || (!ninData.firstname && !ninData.surname)) {
+        return res.status(400).send({ message: "NIN verification failed. Please check the number and try again." });
+      }
+
+      user.verified = "true";
+      await user.save();
+
+      const kyc = new Kyc({
+        user_id: user._id,
+        nin,
+        nin_firstname: ninData.firstname || undefined,
+        nin_surname: ninData.surname || undefined,
+        nin_middlename: ninData.middleName || undefined,
+        date: new Date(),
+      });
+      await kyc.save();
+
+      await SkyId.updateMany(
+        { userId: user._id },
+        { $set: { customerId: user._id.toString() } }
+      );
+
+      const firstName = user.firstName || ninData.firstname || "there";
+      EmailService.sendKYCCompletionEmail(user.email!, firstName);
+      return res.status(200).json({ message: "success" });
+    } catch (err: any) {
+      if (err.message && err.message.includes("Failed to verify NIN")) {
+        return res.status(400).json({ message: "NIN verification failed. Please check the number and try again." });
+      }
       return res.status(500).json({ message: "Internal Server Error!" });
     }
   }
@@ -418,6 +536,90 @@ export default class UserController {
         message: "An error occurred while validating email. Please try again.",
         valid: false 
       });
+    }
+  }
+
+  static async checkEmailAndPhoneExists(req: Request, res: Response) {
+    const { email, phoneNumber } = req.body;
+    try {
+      const { error } = ValidateUserSchema.checkEmailAndPhone({ email, phoneNumber });
+      
+      if (error) {
+        return res.status(400).json({ 
+          message: error.details[0].message,
+          emailExists: false,
+          phoneExists: false,
+          valid: false 
+        });
+      }
+
+      // Check if email already exists
+      const existingUserByEmail = await User.findOne({ email: email.toLowerCase().trim() });
+      const emailExists = !!existingUserByEmail;
+
+      // Check if phone number already exists
+      const existingUserByPhone = await User.findOne({ phoneNumber: phoneNumber.trim() });
+      const phoneExists = !!existingUserByPhone;
+
+      if (emailExists || phoneExists) {
+        const messages: string[] = [];
+        if (emailExists) messages.push("This email is already registered");
+        if (phoneExists) messages.push("This phone number is already registered");
+
+        return res.status(400).json({ 
+          message: messages.join(". "),
+          emailExists,
+          phoneExists,
+          valid: false 
+        });
+      }
+
+      return res.status(200).json({ 
+        message: "Email and phone number are available",
+        emailExists: false,
+        phoneExists: false,
+        valid: true 
+      });
+    } catch (error: any) {
+      console.error("Error checking email and phone:", error);
+      return res.status(500).json({ 
+        message: "An error occurred while validating. Please try again.",
+        emailExists: false,
+        phoneExists: false,
+        valid: false 
+      });
+    }
+  }
+
+  static async checkAvailability(req: Request, res: Response) {
+    const { email, phoneNumber } = req.body;
+    try {
+      const { error } = ValidateUserSchema.checkAvailability({ email, phoneNumber });
+      if (error) {
+        return res.status(400).json({ message: error.details[0].message });
+      }
+
+      const result: { emailExists?: boolean; phoneExists?: boolean } = {};
+      const em = typeof email === "string" && email.trim() ? email.toLowerCase().trim() : undefined;
+      const ph = typeof phoneNumber === "string" && phoneNumber.trim() ? phoneNumber.trim() : undefined;
+
+      if (!em && !ph) {
+        return res.status(400).json({ message: "At least one of email or phoneNumber is required" });
+      }
+
+      if (em) {
+        const existing = await User.findOne({ email: em });
+        result.emailExists = !!existing;
+      }
+      if (ph) {
+        const existing = await User.findOne({ phoneNumber: ph });
+        result.phoneExists = !!existing;
+      }
+
+      return res.status(200).json(result);
+    } catch (error: any) {
+      console.error("Error checking availability:", error);
+      return res.status(500).json({ message: "An error occurred while validating. Please try again." });
     }
   }
 }

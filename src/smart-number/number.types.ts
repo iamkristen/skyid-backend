@@ -10,32 +10,24 @@ const numberSchema = new Schema<INumber>({
 });
 
 export interface IBuyNumber {
-  _id: string;
+  _id?: string; // Optional for signup flow
   skyId: string;
   mappedNumbers: INumber[];
   withIVR: boolean;
   withIVM: boolean;
-  bankName: string;
-  bankAccountName: string;
-  bankAccountNumber: string;
+  bankName?: string; // Optional for signup flow
+  bankAccountName?: string; // Optional for signup flow
+  bankAccountNumber?: string; // Optional for signup flow
   callbackUrl?: string;
+  // For individual signup flow
+  isSignup?: boolean;
+  email?: string;
+  phoneNumber?: string;
 }
 
 export interface INumber {
   number: string;
   network: "MTN" | "GLO" | "AIRTEL" | "ETISALAT";
-}
-
-export interface IBuyNumber {
-  _id: string;
-  skyId: string;
-  mappedNumbers: INumber[];
-  withIVR: boolean;
-  withIVM: boolean;
-  bankName: string;
-  bankAccountName: string;
-  bankAccountNumber: string;
-  callbackUrl?: string;
 }
 
 export interface BuyNumberMeta {

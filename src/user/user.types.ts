@@ -5,6 +5,7 @@ export interface IUser {
   country?: string;
   businessName?: string;
   businessType?: string;
+  cacRnNumber?: string;
   agentCode?: string;
   email?: string;
   phoneNumber?: string;
@@ -18,12 +19,20 @@ export interface IUser {
   accountType?: "Individual" | "Channel_Partner" | "VSO" | "Agent";
   createdBy?: string;
   nin?: string;
+  bvn?: string;
   bankName?: string;
   accountNumber?: string;
   bankCode?: string;
+  accountHolderName?: string;
   channelPartnerLevel?: "Platinum" | "Silver";
   parentChannelPartnerLevel?: "Platinum" | "Silver";
   state?: string;
+  allocationPercent?: number;
+  mustChangePassword?: boolean;
+  twoFactorSecret?: string;
+  twoFactorEnabled?: boolean;
+  profilePicture?: string;
+  bio?: string;
 }
 
 export interface IOtp {

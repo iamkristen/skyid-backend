@@ -9,6 +9,7 @@ const agentCodeSchema = new Schema<IAgentCode>(
   {
     code: { type: String, required: true, unique: true },
     createdFor: { type: String, required: true },
+    createdForType: { type: String, required: true, enum: ["agent", "channel_partner", "vso"] },
     discountPercent: { type: Number, required: true },
     allocationPercent: { type: Number, required: true },
     status: { type: String, required: true, enum: ["active", "inactive"] },

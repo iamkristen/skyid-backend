@@ -40,6 +40,25 @@ const ValidateAuthSchema = {
       businessType: Joi.string().optional(),
     }).validate(payload);
   },
+
+  setNewPassword: (payload: { newPassword: string }) => {
+    return Joi.object({
+      newPassword: Joi.string().min(8).required().messages({
+        "string.min": "Password must be at least 8 characters",
+        "any.required": "New password is required",
+      }),
+    }).validate(payload);
+  },
+
+  changePassword: (payload: { currentPassword: string; newPassword: string }) => {
+    return Joi.object({
+      currentPassword: Joi.string().required().messages({ "any.required": "Current password is required" }),
+      newPassword: Joi.string().min(8).required().messages({
+        "string.min": "New password must be at least 8 characters",
+        "any.required": "New password is required",
+      }),
+    }).validate(payload);
+  },
 };
 
 export default ValidateAuthSchema;

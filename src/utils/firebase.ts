@@ -1,10 +1,10 @@
 import admin from "firebase-admin";
 
-const serviceAccount = require("./skyid-4b3f0-firebase-adminsdk-fbsvc-9ba766719c.json");
+const serviceAccount = require("./serviceAccountKey.json");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  storageBucket: "skyid-4b3f0.firebasestorage.app",
+  storageBucket: "skyid-dev.firebasestorage.app",
 });
 
 const bucket = admin.storage().bucket();

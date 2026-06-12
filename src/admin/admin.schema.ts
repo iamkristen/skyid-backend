@@ -28,7 +28,7 @@ export const validation = {
           "any.required": "Last name is required",
         }),
       email: Joi.string().email().required(),
-      password: Joi.string().min(5).required(),
+      password: Joi.string().min(5).optional().strip(),
       phoneNumber: Joi.string()
         .pattern(/^(\+?234|0)[789][01]\d{8}$/, "Nigeria phone number")
         .required()
@@ -38,9 +38,8 @@ export const validation = {
           "string.empty": "Phone number is required",
           "any.required": "Phone number is required",
         }),
-      role: Joi.string().messages({
-        "any.required": "role is required",
-      }),
+      role: Joi.string(),
+      roles: Joi.array().items(Joi.string()),
     }).validate(signup);
   },
 

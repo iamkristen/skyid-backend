@@ -19,6 +19,7 @@ export interface IAgentCode {
   expiresAt?: Date;
   status: "active" | "inactive";
   createdFor: string;
+  createdForType: "agent" | "channel_partner" | "vso";
   updatedBy?: string;
   createdAt?: Date;
   updatedAt?: Date;

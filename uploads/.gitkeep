@@ -1,0 +1,6 @@
+# This file ensures the uploads directory is tracked by git
+# Uploaded files will be stored here temporarily (simulation mode)
+# TODO: Replace with Azure Blob Storage
+
+
+

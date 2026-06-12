@@ -14,6 +14,8 @@ import KycRoute from "../kyc/kyc.routes";
 import AgentRoute from "../agent/agent.routes";
 import AuthRoutes from "../auth/auth.routes";
 import CompetitionRoutes from "../competition/competition.routes";
+import CommunityRoutes from "../community/community.routes";
+import MessagingRoutes from "../messaging/messaging.routes";
 
 const routers = Router();
 
@@ -32,6 +34,8 @@ routers.use("/admin", UserManagementRoute);
 routers.use("/kyc", KycRoute);
 routers.use("/agent", AgentRoute);
 routers.use("/competition", CompetitionRoutes);
+routers.use("/community", CommunityRoutes);
+routers.use("/messaging", MessagingRoutes);
 
 // Integration routes for third-party services
 routers.use("/integration", AuthRoutes);

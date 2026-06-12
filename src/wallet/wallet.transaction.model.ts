@@ -14,6 +14,11 @@ const transactionSchema = new Schema<ITransaction>(
     ivm: Boolean,
     paymentType: String,
     txnRef: String,
+    // 
+    isSignup: Boolean,
+    signupEmail: String,
+    signupPhoneNumber: String,
+    // 
   },
   { timestamps: true }
 );

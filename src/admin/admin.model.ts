@@ -9,8 +9,12 @@ const userSchema = new Schema<IAdminUser>({
   password: String,
   phoneNumber: String,
   role: String,
+  roles: { type: [String], default: undefined },
   verified: String,
+  status: { type: String, default: "active" },
   date: { type: Date, default: Date.now },
+  twoFactorSecret: { type: String, default: null },
+  twoFactorEnabled: { type: Boolean, default: false },
 });
 
 // 3 Create a Model

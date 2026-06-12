@@ -66,12 +66,61 @@ const ValidateUserSchema = {
     }).validate(kyc);
   },
 
+  /** Individual KYC: NIN only (verified before submit); backend re-verifies and stores NIN details */
+  kycIndividual: (payload: { nin: string }) => {
+    return Joi.object({
+      nin: Joi.string()
+        .pattern(/^[0-9]{11}$/, "11-digit NIN")
+        .required()
+        .messages({
+          "string.pattern.base": "NIN must be exactly 11 digits",
+          "any.required": "NIN is required",
+        }),
+    }).validate(payload);
+  },
+
   validatePublicSignupEmail: (email: string) => {
     return Joi.string().email().required().messages({
       "string.email": "Please provide a valid email address",
       "string.empty": "Email is required",
       "any.required": "Email is required",
     }).validate(email);
+  },
+
+  checkEmailAndPhone: (data: { email: string; phoneNumber: string }) => {
+    return Joi.object({
+      email: Joi.string().email().required().messages({
+        "string.email": "Please provide a valid email address",
+        "string.empty": "Email is required",
+        "any.required": "Email is required",
+      }),
+      phoneNumber: Joi.string()
+        .pattern(/^(\+?234|0)[789][01]\d{8}$/, "Nigeria phone number")
+        .required()
+        .messages({
+          "string.pattern.name": "Phone number must be a valid Nigerian phone number",
+          "string.base": "Phone number must be a string",
+          "string.empty": "Phone number is required",
+          "any.required": "Phone number is required",
+        }),
+    }).validate(data);
+  },
+
+  checkAvailability: (data: { email?: string; phoneNumber?: string }) => {
+    return Joi.object({
+      email: Joi.string().email().optional().messages({
+        "string.email": "Please provide a valid email address",
+      }),
+      phoneNumber: Joi.string()
+        .pattern(/^(\+?234|0)[789][01]\d{8}$/, "Nigeria phone number")
+        .optional()
+        .messages({
+          "string.pattern.name": "Phone number must be a valid Nigerian phone number",
+        }),
+    })
+      .or("email", "phoneNumber")
+      .messages({ "object.missing": "At least one of email or phoneNumber is required" })
+      .validate(data);
   },
 };
 

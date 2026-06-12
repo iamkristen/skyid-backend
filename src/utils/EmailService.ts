@@ -11,6 +11,12 @@ import {
   depositMoneyTemplate,
   channelPartnerApproved,
   channelPartnerCreation,
+  adminAccountCreated,
+  adminLoginOtpTemplate,
+  adminLoginSecurityAlert,
+  individualSignupSuccess,
+  individualMappingWelcome,
+  smartNumberPurchaseConfirmation,
 } from "../views/email-template";
 import { mappingRequestApproved, mappingRequestRejected } from "../views/mapping-notifications";
 import { IChannelPartner } from "../partner/partner.types";
@@ -35,15 +41,18 @@ const emailType: EmailType = {
   VSO_TOPUP_APPROVED: ["Top-Up Request Approved - SKYID", "vsoTopUpApproved"],
   VSO_TOPUP_REJECTED: ["Top-Up Request Rejected - SKYID", "vsoTopUpRejected"],
   VSO_TOPUP_REQUESTED: ["New VSO Top-Up Request - SKYID", "vsoTopUpRequested"],
+  ADMIN_ACCOUNT_CREATED: ["Your SkyID Admin Account - Login Details", "adminAccountCreated"],
+  ADMIN_LOGIN_OTP: ["Your SkyID Admin login code", "adminLoginOtpTemplate"],
+  ADMIN_LOGIN_SECURITY_ALERT: ["Security alert: new sign-in to your SkyID admin", "adminLoginSecurityAlert"],
 };
 
 // Initialize Resend only if EMAIL_SECRET_KEY is provided (optional for development)
-const resend = process.env.EMAIL_SECRET_KEY 
+const resend = process.env.EMAIL_SECRET_KEY
   ? new Resend(process.env.EMAIL_SECRET_KEY as string)
   : null;
 
-if (!resend && process.env.NODE_ENV !== 'test') {
-  console.warn('⚠️  EMAIL_SECRET_KEY not set - Email service disabled. Emails will not be sent.');
+if (!resend && process.env.NODE_ENV !== "test") {
+  console.warn("⚠️  EMAIL_SECRET_KEY not set - Email service disabled. Emails will not be sent.");
 }
 
 type Data = {
@@ -88,6 +97,31 @@ export default class EmailService {
         mailOptions.html = channelPartnerCreation(name || "", password);
         mailOptions.subject = subject;
         break;
+      case "adminAccountCreated": {
+        const adminData = data as { email: string; loginUrl?: string };
+        if (!name || !password || !adminData?.email) {
+          throw new Error("Name, email and password are required for admin account created email");
+        }
+        const loginUrl = adminData.loginUrl || "https://admin.dev.skyid.ng";
+        mailOptions.html = adminAccountCreated(name || "", adminData.email, password, loginUrl);
+        mailOptions.subject = subject;
+        break;
+      }
+      case "adminLoginOtpTemplate": {
+        if (!otp) throw new Error("OTP is required for admin login OTP email");
+        mailOptions.html = adminLoginOtpTemplate(name || "", otp);
+        mailOptions.subject = subject;
+        break;
+      }
+      case "adminLoginSecurityAlert": {
+        const d = data as { location?: string; browser?: string; loginTime?: string };
+        if (!name || d?.location == null || d?.browser == null || d?.loginTime == null) {
+          throw new Error("Name, location, browser and loginTime are required for admin login security alert");
+        }
+        mailOptions.html = adminLoginSecurityAlert(name || "", d.location, d.browser, d.loginTime);
+        mailOptions.subject = subject;
+        break;
+      }
 
       case "channelPartner":
         if (!partnerDetails) {
@@ -385,21 +419,15 @@ export default class EmailService {
     // Skip email sending if Resend is not configured (development mode)
     if (!resend) {
       console.warn(`📧 [DEV MODE] Email would be sent to ${email} - Subject: ${mailOptions.subject}`);
-      
-      // Log OTP code clearly if this is an OTP email
       if (otp && (type === "OTP_EMAIL" || type === "FORGOT_PASSWORD")) {
         console.warn(`🔑 [DEV MODE] OTP Code: ${otp}`);
         console.warn(`📧 [DEV MODE] Email Type: ${type === "OTP_EMAIL" ? "Email Verification" : "Password Reset"}`);
       }
-      
-      // Log full email content
-      console.warn(`📧 [DEV MODE] Full Email Content:`);
-      console.warn(mailOptions.html);
-      return { id: 'dev-mode-skip', message: 'Email skipped in development mode' };
+      return { id: "dev-mode-skip", message: "Email skipped in development mode" };
     }
 
     console.info(`Email on it's way to ${email}`);
-    const response = await resend.emails.send(mailOptions);
+    const response = await resend?.emails.send(mailOptions);
     console.info(response, "response");
 
     return response;
@@ -407,6 +435,28 @@ export default class EmailService {
 
   static async sendWelcomeEmail(to: string, fullName: string) {
     return await this._sendMail("WELCOME_EMAIL", to, fullName);
+  }
+
+  static async sendAdminAccountCreated(to: string, fullName: string, loginEmail: string, password: string, loginUrl: string = "https://admin.dev.skyid.ng") {
+    return await this._sendMail("ADMIN_ACCOUNT_CREATED", to, fullName, { email: loginEmail, loginUrl }, undefined, undefined, undefined, password);
+  }
+
+  static async sendAdminLoginOtp(to: string, fullName: string, otp: string) {
+    return await this._sendMail("ADMIN_LOGIN_OTP", to, fullName, undefined, undefined, otp);
+  }
+
+  static async sendAdminLoginSecurityAlert(
+    to: string,
+    fullName: string,
+    location: string,
+    browser: string,
+    loginTime: string
+  ) {
+    return await this._sendMail("ADMIN_LOGIN_SECURITY_ALERT", to, fullName, {
+      location,
+      browser,
+      loginTime,
+    });
   }
 
   static async sendOTPEmail(to: string, fullName: string, otp: string) {
@@ -514,5 +564,108 @@ export default class EmailService {
 
   static async sendVSOTopUpRequested(to: string, fullName: string, vsoName: string, amount: number) {
     return await this._sendMail("VSO_TOPUP_REQUESTED", to, fullName, { vsoName }, String(amount));
+  }
+
+  /** Migration email for create-individual-mapping (short, no "account created" wording). */
+  static async sendIndividualMappingWelcome(
+    to: string,
+    firstName: string,
+    loginUrl: string,
+    email: string,
+    password: string,
+    companyName: string = "SkyID"
+  ) {
+    const mailOptions: CreateEmailOptions = {
+      from: "no-reply@skyid.ng",
+      to: [to],
+      subject: "Your SkyID – login details",
+      html: individualMappingWelcome(firstName, loginUrl, email, password, companyName),
+    };
+    console.info(`Sending migration welcome email to ${to}`);
+    return await resend?.emails.send(mailOptions);
+  }
+
+  static async sendIndividualSignupSuccess(
+    to: string,
+    firstName: string,
+    loginUrl: string,
+    email: string,
+    password: string,
+    companyName: string = "SKY ID"
+  ) {
+    const mailOptions: CreateEmailOptions = {
+      from: "no-reply@skyid.ng",
+      to: [to],
+      subject: "Smart Number Purchase Successful - Your Account is Ready",
+      html: individualSignupSuccess(firstName, loginUrl, email, password, companyName),
+    };
+
+    console.info(`Sending signup success email to ${to}`);
+    const response = await resend?.emails.send(mailOptions);
+    console.info(response, "response");
+
+    return response;
+  }
+
+  static async sendSmartNumberPurchaseConfirmation(
+    to: string,
+    firstName: string,
+    skyId: string,
+    companyName: string = "SKY ID"
+  ) {
+    const mailOptions: CreateEmailOptions = {
+      from: "no-reply@skyid.ng",
+      to: [to],
+      subject: "Smart Number Purchase Successful",
+      html: smartNumberPurchaseConfirmation(firstName, skyId, companyName),
+    };
+
+    console.info(`Sending smart number purchase confirmation email to ${to}`);
+    const response = await resend?.emails.send(mailOptions);
+    console.info(response, "response");
+
+    return response;
+  }
+
+  /** Notifies the Switch team inbox when a create-individual request reaches Level 3 (after L2 approval). */
+  static async notifySwitchTeamCreateIndividualPendingLevel3(params: {
+    requestId: string;
+    skyId: string;
+    firstName: string;
+    lastName: string;
+    email: string;
+    phoneNumber: string;
+    submissionSource?: string;
+  }): Promise<void> {
+    const esc = (s: string) =>
+      (s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    const to = process.env.SWITCH_TEAM_L3_NOTIFY_EMAIL || "switch@itskysolutions.com";
+    const sourceLabel =
+      params.submissionSource === "mapping_page" ? "New manual activation" : "Preloaded / claim & assign";
+    const html = `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#111827;">
+      <h1 style="font-size:18px;margin:0 0 16px;">Create Individual — ready for Level 3</h1>
+      <p style="margin:0 0 16px;font-size:14px;line-height:1.5;">A request has been approved at Level 2 and is now pending <strong>Level 3</strong> review in the admin dashboard.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;font-size:13px;">
+        <tr><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">Type</td><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;font-weight:600;">${sourceLabel}</td></tr>
+        <tr><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">Sky ID</td><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;font-weight:600;font-family:ui-monospace,monospace;">${esc(params.skyId)}</td></tr>
+        <tr><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">Owner name</td><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">${esc(params.firstName)} ${esc(params.lastName)}</td></tr>
+        <tr><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">Email</td><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">${esc(params.email)}</td></tr>
+        <tr><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">Phone</td><td style="padding:10px 14px;border-bottom:1px solid #e5e7eb;">${esc(params.phoneNumber)}</td></tr>
+        <tr><td style="padding:10px 14px;">Request ID</td><td style="padding:10px 14px;font-family:ui-monospace,monospace;font-size:12px;">${esc(params.requestId)}</td></tr>
+      </table>
+      <p style="margin:16px 0 0;font-size:12px;color:#6b7280;">This is an automated message from SkyID.</p>
+    </div>`;
+
+    await resend?.emails.send({
+      from: "no-reply@skyid.ng",
+      to: [to],
+      subject: `SkyID Switch — Level 3 review: ${params.skyId}`,
+      html,
+    });
+    console.info(`Switch L3 pending notification sent to ${to} for request ${params.requestId}`);
   }
 }

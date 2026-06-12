@@ -13,20 +13,11 @@ export const database = () => {
 };
 
 export const KiraniDatabase = () => {
-  // Make Kirani database optional for development
-  if (!process.env.KIRANI_MONGOOSE_URL) {
-    if (process.env.NODE_ENV !== 'test') {
-      console.warn('⚠️  KIRANI_MONGOOSE_URL not set - Kirani Database disabled. Some features may not work.');
-    }
-    return null;
-  }
-
   try {
     const connection = mongoose.createConnection(process.env.KIRANI_MONGOOSE_URL as never);
     console.log("✅ Kirani Database is connected");
     return connection;
   } catch (error) {
     console.log(error, "❌ error");
-    return null;
   }
 };

@@ -22,11 +22,26 @@ const ValidateNumberSchema = {
       mappedNumbers: Joi.array().items(numberValidator).min(1).required(),
       withIVR: Joi.boolean().required(),
       withIVM: Joi.boolean().required(),
-      _id: Joi.string().required(),
+      _id: Joi.string().when("isSignup", {
+        is: true,
+        then: Joi.optional(),
+        otherwise: Joi.required(),
+      }),
       bankName: Joi.string().optional(),
       bankAccountName: Joi.string().optional(),
       bankAccountNumber: Joi.string().optional(),
-      callbackUrl: Joi.string(),
+      callbackUrl: Joi.string().optional(),
+      isSignup: Joi.boolean().optional(),
+      email: Joi.string().email().when("isSignup", {
+        is: true,
+        then: Joi.required(),
+        otherwise: Joi.optional(),
+      }),
+      phoneNumber: Joi.string().when("isSignup", {
+        is: true,
+        then: Joi.required(),
+        otherwise: Joi.optional(),
+      }),
     }).validate(payload);
   },
 
